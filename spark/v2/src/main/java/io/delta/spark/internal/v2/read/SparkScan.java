@@ -360,4 +360,34 @@ public class SparkScan implements Scan, SupportsReportStatistics, SupportsRuntim
               String.join(", ", SUPPORTED_STREAMING_OPTIONS)));
     }
   }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    SparkScan that = (SparkScan) o;
+    return Objects.equals(initialSnapshot.getPath(), that.initialSnapshot.getPath())
+        && Objects.equals(dataSchema, that.dataSchema)
+        && Objects.equals(partitionSchema, that.partitionSchema)
+        && Objects.equals(readDataSchema, that.readDataSchema)
+        && Arrays.equals(pushedToKernelFilters, that.pushedToKernelFilters)
+        && Arrays.equals(dataFilters, that.dataFilters)
+        // ignoring kernelScan because it is derived from Snapshot which is created from tablePath,
+        // with pushed down filters that are also recorded in `pushedToKernelFilters`
+        && Objects.equals(options, that.options);
+  }
+
+  @Override
+  public int hashCode() {
+    int result =
+        Objects.hash(
+            initialSnapshot.getPath(), dataSchema, partitionSchema, readDataSchema, options);
+    result = 31 * result + Arrays.hashCode(pushedToKernelFilters);
+    result = 31 * result + Arrays.hashCode(dataFilters);
+    return result;
+  }
 }

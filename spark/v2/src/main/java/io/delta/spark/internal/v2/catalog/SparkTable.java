@@ -229,6 +229,25 @@ public class SparkTable implements Table, SupportsRead {
     return "SparkTable{identifier=" + identifier + '}';
   }
 
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    SparkTable that = (SparkTable) o;
+    return Objects.equals(identifier, that.identifier)
+        && Objects.equals(tablePath, that.tablePath)
+        && Objects.equals(options, that.options);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(identifier, tablePath, options);
+  }
+
   /**
    * Private helper class that lazily computes and caches schema-related metadata.
    *
