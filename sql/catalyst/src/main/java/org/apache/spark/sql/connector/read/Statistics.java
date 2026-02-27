@@ -38,4 +38,16 @@ public interface Statistics {
   default Map<NamedReference, ColumnStatistics> columnStats() {
     return new HashMap<>();
   }
+
+  /**
+   * Returns the total number of rows in the data source before any filter pushdown.
+   * <p>
+   * Data sources that push filters and return pruned statistics from {@link #numRows()} should
+   * override this method to return the total (unfiltered) row count. 
+   * 
+   * @since 4.1.0
+   */
+  default OptionalLong numRowsBeforeFilters() {
+    return OptionalLong.empty();
+  }
 }

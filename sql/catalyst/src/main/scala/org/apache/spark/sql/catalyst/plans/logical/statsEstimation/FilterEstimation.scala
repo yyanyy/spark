@@ -25,6 +25,8 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.Literal.{FalseLiteral, TrueLiteral}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.EstimationUtils._
+import org.apache.spark.sql.connector.read.SupportsReportStatistics
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
 import org.apache.spark.sql.types._
 
 case class FilterEstimation(plan: Filter) extends Logging {
@@ -32,6 +34,45 @@ case class FilterEstimation(plan: Filter) extends Logging {
   private val childStats = plan.child.stats
 
   private val colStatsMap = ColumnStatsMap(childStats.attributeStats)
+
+  /**
+   * For DSv2 scans that push filters, the child's row count may already reflect post-filter
+   * pruning. This extracts the pre-filter total row count (if reported by the scan) so that
+   * NDV-dependent selectivity estimates can use the correct base population.
+   */
+  private lazy val dsv2TotalRowCount: Option[BigInt] = plan.child match {
+    case dsv2: DataSourceV2ScanRelation => dsv2.scan match {
+      case r: SupportsReportStatistics =>
+        val stats = r.estimateStatistics()
+        if (stats.numRowsBeforeFilters().isPresent) {
+          Some(BigInt(stats.numRowsBeforeFilters().getAsLong))
+        } else {
+          None
+        }
+      case _ => None
+    }
+    case _ => None
+  }
+
+  /**
+   * Adjusts an NDV-based selectivity to account for DSv2 filter pushdown.
+   *
+   * When the child scan has already pruned rows via pushed filters, `childStats.rowCount`
+   * is the post-filter count but NDV typically reflects the full table. A raw selectivity of
+   * `1/NDV` is a fraction of the total population, not the pruned population. This method
+   * rescales the selectivity so that when multiplied by the pruned row count, the result
+   * equals `min(totalRows * baseSel, prunedRows)`.
+   *
+   * For non-DSv2 children or when `numRowsBeforeFilters` is not reported, returns baseSel
+   * unchanged.
+   */
+  private def adjustNdvBasedSelectivity(baseSel: Double): Double = {
+    (dsv2TotalRowCount, childStats.rowCount) match {
+      case (Some(totalRows), Some(prunedRows)) if totalRows > prunedRows =>
+        math.min(totalRows.toDouble * baseSel / prunedRows.toDouble, 1.0)
+      case _ => baseSel
+    }
+  }
 
   /**
    * Returns an option of Statistics for a Filter logical plan node.
@@ -80,44 +121,104 @@ case class FilterEstimation(plan: Filter) extends Logging {
    *         It returns None if the condition is not supported.
    */
   def calculateFilterSelectivity(condition: Expression, update: Boolean = true): Option[Double] = {
+    calculateSelectivityComponents(condition, update).map { case (ndvSel, otherSel) =>
+      adjustNdvBasedSelectivity(ndvSel) * otherSel
+    }
+  }
+
+  /**
+   * Computes selectivity as separate (ndvSel, otherSel) components.
+   *
+   * NDV-based selectivities (equality, InSet, boundary) are fractions of the total population,
+   * while range-based selectivities are fractions of the pruned population. Keeping them
+   * separate through AND (multiplicative) allows a single adjustment at the end. For OR and
+   * NOT (non-multiplicative), components are resolved to pruned-space first.
+   *
+   * @return Option[(ndvSel, otherSel)] where combined selectivity = adjust(ndvSel) * otherSel
+   */
+  private def calculateSelectivityComponents(
+      condition: Expression, update: Boolean = true): Option[(Double, Double)] = {
     condition match {
       case And(cond1, cond2) =>
-        val percent1 = calculateFilterSelectivity(cond1, update).getOrElse(1.0)
-        val percent2 = calculateFilterSelectivity(cond2, update).getOrElse(1.0)
-        Some(percent1 * percent2)
+        val (ndv1, other1) = calculateSelectivityComponents(cond1, update)
+          .getOrElse((1.0, 1.0))
+        val (ndv2, other2) = calculateSelectivityComponents(cond2, update)
+          .getOrElse((1.0, 1.0))
+        Some((ndv1 * ndv2, other1 * other2))
 
       case Or(cond1, cond2) =>
-        val percent1 = calculateFilterSelectivity(cond1, update = false).getOrElse(1.0)
-        val percent2 = calculateFilterSelectivity(cond2, update = false).getOrElse(1.0)
-        Some(percent1 + percent2 - (percent1 * percent2))
+        val (ndv1, other1) = calculateSelectivityComponents(cond1, update = false)
+          .getOrElse((1.0, 1.0))
+        val (ndv2, other2) = calculateSelectivityComponents(cond2, update = false)
+          .getOrElse((1.0, 1.0))
+        if (other1 == 1.0 && other2 == 1.0) {
+          // Both sides are pure NDV - combine directly in total-row (NDV) space.
+          // This avoids the approximation error that arises from resolving to pruned-space
+          // before combining, and produces DSv1-exact results for pure-NDV expressions.
+          Some((ndv1 + ndv2 - ndv1 * ndv2, 1.0))
+        } else {
+          // Mixed: resolve each side to pruned-space before non-multiplicative combining.
+          val p1 = adjustNdvBasedSelectivity(ndv1) * other1
+          val p2 = adjustNdvBasedSelectivity(ndv2) * other2
+          Some((1.0, p1 + p2 - (p1 * p2)))
+        }
 
       // Not-operator pushdown
       case Not(And(cond1, cond2)) =>
-        calculateFilterSelectivity(Or(Not(cond1), Not(cond2)), update = false)
+        calculateSelectivityComponents(Or(Not(cond1), Not(cond2)), update = false)
 
       // Not-operator pushdown
       case Not(Or(cond1, cond2)) =>
-        calculateFilterSelectivity(And(Not(cond1), Not(cond2)), update = false)
+        calculateSelectivityComponents(And(Not(cond1), Not(cond2)), update = false)
 
-      // Collapse two consecutive Not operators which could be generated after Not-operator pushdown
+      // Collapse two consecutive Not operators
       case Not(Not(cond)) =>
-        calculateFilterSelectivity(cond, update = false)
+        calculateSelectivityComponents(cond, update = false)
 
-      // The foldable Not has been processed in the ConstantFolding rule
-      // This is a top-down traversal. The Not could be pushed down by the above two cases.
       case Not(l @ Literal(null, _)) =>
-        calculateSingleCondition(l, update = false).map(boundProbability(_))
+        calculateSingleCondition(l, update = false)
+          .map(sel => (1.0, boundProbability(sel)))
 
       case Not(cond) =>
-        calculateFilterSelectivity(cond, update = false) match {
-          case Some(percent) => Some(1.0 - percent)
-          case None => None
+        calculateSelectivityComponents(cond, update = false).map { case (ndv, other) =>
+          if (other == 1.0) {
+            // Pure NDV: invert directly in total-row (NDV) space, preserving the NDV
+            // component so that enclosing AND/OR can combine it correctly.
+            (1.0 - ndv, 1.0)
+          } else {
+            // Mixed: resolve to pruned-space before inverting.
+            val p = adjustNdvBasedSelectivity(ndv) * other
+            (1.0, 1.0 - p)
+          }
         }
 
       case _ =>
-        calculateSingleCondition(condition, update).map(boundProbability(_))
+        evaluateLeafAsComponents(condition, update)
     }
   }
+
+  /**
+   * Evaluates a leaf condition and classifies its selectivity as either NDV-dependent
+   * (returned in the first component) or range/other (returned in the second component).
+   */
+  private def evaluateLeafAsComponents(
+      condition: Expression, update: Boolean): Option[(Double, Double)] = {
+    // Use a local flag to detect whether the leaf evaluation is NDV-dependent.
+    // The flag is set by evaluateEquality, evaluateInSet, and boundary cases in
+    // evaluateBinaryForNumeric. Range conditions do not set it.
+    hasNdvDependentCondition = false
+    val sel = calculateSingleCondition(condition, update).map(boundProbability(_))
+    sel.map { s =>
+      if (hasNdvDependentCondition) (s, 1.0) else (1.0, s)
+    }
+  }
+
+  /**
+   * Flag used by evaluateLeafAsComponents to detect NDV-dependent leaf conditions.
+   * Set by evaluateEquality, evaluateInSet, and boundary NDV cases in
+   * evaluateBinaryForNumeric. Reset before each leaf evaluation.
+   */
+  private var hasNdvDependentCondition: Boolean = false
 
   /**
    * Returns a percentage of rows meeting a single condition in Filter node.
@@ -334,12 +435,13 @@ case class FilterEstimation(plan: Filter) extends Logging {
 
       if (colStat.histogram.isEmpty) {
         if (!colStat.distinctCount.isEmpty) {
-          // returns 1/ndv if there is no histogram
+          hasNdvDependentCondition = true
           Some(1.0 / colStat.distinctCount.get.toDouble)
         } else {
           None
         }
       } else {
+        hasNdvDependentCondition = true
         Some(computeEqualityPossibilityByHistogram(literal, colStat))
       }
 
@@ -435,8 +537,9 @@ case class FilterEstimation(plan: Filter) extends Logging {
         }
     }
 
-    // return the filter selectivity.  Without advanced statistics such as histograms,
-    // we have to assume uniform distribution.
+    // return the filter selectivity.
+    // Without advanced statistics such as histograms, we assume uniform distribution.
+    hasNdvDependentCondition = true
     Some(math.min(newNdv.toDouble / ndv.toDouble, 1.0))
   }
 
@@ -506,6 +609,7 @@ case class FilterEstimation(plan: Filter) extends Logging {
           case _: LessThanOrEqual =>
             if (numericLiteral == min) {
               // The boundary value is the only satisfying value.
+              hasNdvDependentCondition = true
               1.0 / ndv
             } else {
               (numericLiteral - min) / (max - min)
@@ -518,6 +622,7 @@ case class FilterEstimation(plan: Filter) extends Logging {
             }
           case _: GreaterThanOrEqual =>
             if (numericLiteral == max) {
+              hasNdvDependentCondition = true
               1.0 / ndv
             } else {
               (max - numericLiteral) / (max - min)

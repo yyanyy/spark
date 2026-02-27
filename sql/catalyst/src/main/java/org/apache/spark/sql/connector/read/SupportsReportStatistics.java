@@ -26,6 +26,19 @@ import org.apache.spark.annotation.Evolving;
  * As of Spark 3.0, statistics are reported to the optimizer after operators are pushed to the
  * data source. Implementations may return more accurate statistics based on pushed operators
  * which may improve query performance by providing better information to the optimizer.
+ * <p>
+ * When filters are pushed to the data source, the returned {@link Statistics#numRows()} should
+ * reflect the post-filter row count (i.e., the estimated number of rows after pushed predicates
+ * are applied). Column statistics such as min, max, and null count may also be updated to reflect
+ * the pruned data.
+ * <p>
+ * However, non-decomposable column statistics like NDV (number of distinct values) typically
+ * cannot be accurately recomputed after filter pushdown and often remain at their full-table
+ * values. This can cause the optimizer to underestimate the output of NDV-dependent filters
+ * (such as equality and IN predicates) when applied on top of already-pruned statistics. To
+ * address this, data sources should also implement {@link Statistics#numRowsBeforeFilters()} to
+ * report the pre-filter total row count, enabling the optimizer to correctly rescale NDV-based
+ * selectivity estimates.
  *
  * @since 3.0.0
  */
