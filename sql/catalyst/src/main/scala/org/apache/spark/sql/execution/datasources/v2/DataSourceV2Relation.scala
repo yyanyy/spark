@@ -306,16 +306,21 @@ object DataSourceV2Relation {
       v2Statistics: V2Statistics,
       defaultRowCount: Option[BigInt],
       defaultSizeInBytes: Long,
-      output: Seq[Attribute] = Seq.empty): Statistics = {
+      output: Seq[Attribute] = Seq.empty,
+      usePreFilterStats: Boolean = false): Statistics = {
     val numRows: Option[BigInt] = if (v2Statistics.numRows().isPresent) {
       Some(v2Statistics.numRows().getAsLong)
     } else {
       defaultRowCount
     }
 
+    val v2ColumnStat = if (usePreFilterStats) {
+      v2Statistics.columnStatsBeforeFilters()
+    } else {
+      v2Statistics.columnStats()
+    }
     var colStats: Seq[(Attribute, ColumnStat)] = Seq.empty[(Attribute, ColumnStat)]
-    if (!v2Statistics.columnStats().isEmpty) {
-      val v2ColumnStat = v2Statistics.columnStats()
+    if (!v2ColumnStat.isEmpty) {
       val keys = v2ColumnStat.keySet()
 
       keys.forEach(key => {

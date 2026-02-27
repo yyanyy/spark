@@ -25,11 +25,50 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.Literal.{FalseLiteral, TrueLiteral}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.EstimationUtils._
+import org.apache.spark.sql.connector.read.SupportsReportStatistics
+import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, DataSourceV2ScanRelation}
 import org.apache.spark.sql.types._
 
 case class FilterEstimation(plan: Filter) extends Logging {
 
-  private val childStats = plan.child.stats
+  /**
+   * The effective child statistics used for all selectivity computation.
+   *
+   * For DSv2 scans that report pre-filter statistics via
+   * {@link Statistics#numRowsBeforeFilters()} and {@link Statistics#columnStatsBeforeFilters()},
+   * this substitutes the pre-filter row count and column stats so that selectivity is computed
+   * against full-table values -- identical to DSv1 behavior where stats always represent the
+   * full table.
+   *
+   * For non-DSv2 children or when pre-filter stats are not reported, this is simply the
+   * child's stats unchanged.
+   */
+  private val childStats: Statistics = {
+    val baseStats = plan.child.stats
+    plan.child match {
+      case dsv2: DataSourceV2ScanRelation => dsv2.scan match {
+        case r: SupportsReportStatistics =>
+          val v2Stats = r.estimateStatistics()
+          val hasPreFilterRowCount = v2Stats.numRowsBeforeFilters().isPresent
+          val preFilterV2ColStats = v2Stats.columnStatsBeforeFilters()
+          val hasPreFilterColStats = !preFilterV2ColStats.isEmpty
+
+          if (hasPreFilterRowCount && hasPreFilterColStats) {
+            val totalRowCount = BigInt(v2Stats.numRowsBeforeFilters().getAsLong)
+            val preFilterStats = DataSourceV2Relation.transformV2Stats(
+              v2Stats, None, baseStats.sizeInBytes.toLong, dsv2.output,
+              usePreFilterStats = true)
+            baseStats.copy(
+              rowCount = Some(totalRowCount),
+              attributeStats = preFilterStats.attributeStats)
+          } else {
+            baseStats
+          }
+        case _ => baseStats
+      }
+      case _ => baseStats
+    }
+  }
 
   private val colStatsMap = ColumnStatsMap(childStats.attributeStats)
 
@@ -860,6 +899,7 @@ case class FilterEstimation(plan: Filter) extends Logging {
   private def boundProbability(p: Double): Double = {
     Math.max(0.0, Math.min(1.0, p))
   }
+
 }
 
 /**
