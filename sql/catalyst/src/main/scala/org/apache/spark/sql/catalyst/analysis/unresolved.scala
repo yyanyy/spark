@@ -144,7 +144,7 @@ case class UnresolvedRelation(
   def requireWritePrivileges(privileges: Set[TableWritePrivilege]): UnresolvedRelation = {
     if (privileges.nonEmpty) {
       val newOptions = new java.util.HashMap[String, String]
-      newOptions.putAll(options)
+      newOptions.putAll(options.asCaseSensitiveMap())
       newOptions.put(UnresolvedRelation.REQUIRED_WRITE_PRIVILEGES, privileges.mkString(","))
       copy(options = new CaseInsensitiveStringMap(newOptions))
     } else {
@@ -155,7 +155,7 @@ case class UnresolvedRelation(
   def clearWritePrivileges: UnresolvedRelation = {
     if (options.containsKey(UnresolvedRelation.REQUIRED_WRITE_PRIVILEGES)) {
       val newOptions = new java.util.HashMap[String, String]
-      newOptions.putAll(options)
+      newOptions.putAll(options.asCaseSensitiveMap())
       newOptions.remove(UnresolvedRelation.REQUIRED_WRITE_PRIVILEGES)
       copy(options = new CaseInsensitiveStringMap(newOptions))
     } else {
